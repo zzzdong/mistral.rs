@@ -4,13 +4,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use candle_core::{DType, Device, Module, Result, Tensor};
+use candle_core::quantized::QTensor;
 use candle_nn::Embedding;
 use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
 
 use crate::attention::SdpaParams;
 use crate::device_map::{DeviceMappedMask, DeviceMapper};
 use crate::gguf::Content;
-use crate::layers::{CausalMasker, MatMul, QRmsNorm, RotaryEmbedding, Sdpa};
+use crate::layers::{CausalMasker, MatMul, RotaryEmbedding, Sdpa};
 use crate::layers_masker::PastKvLenCache;
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
@@ -21,6 +22,29 @@ use crate::utils::progress::{new_multi_progress, NiceProgressBar};
 
 // Default fallback for models that don't specify context_length
 const DEFAULT_MAX_SEQ_LEN: u32 = 4096;
+
+/// Qwen3.5 RMSNorm: uses (1.0 + weight) like Gemma
+/// The GGUF stores the original weight (initialized to 0), and we add 1.0 at runtime
+struct Qwen35RmsNorm {
+    eps: f64,
+    weight: Tensor,
+}
+
+impl Qwen35RmsNorm {
+    pub fn new(scale: QTensor, eps: f32) -> Result<Self> {
+        let weight = scale.dequantize(&scale.device())?;
+        // Qwen3.5 uses (1.0 + weight) formulation
+        let weight = (&weight + 1.0)?;
+        Ok(Self {
+            eps: eps as f64,
+            weight,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        candle_nn::ops::rms_norm(&x.contiguous()?, &self.weight, self.eps as f32)
+    }
+}
 
 /// Linear attention layer using Gated Delta Net
 /// This is a simplified quantized version that uses GGUF quantized weights
@@ -78,7 +102,9 @@ impl LinearAttention {
 
         let a_log = ct.tensor(&format!("{prefix}.ssm_a"), device)?.dequantize(device)?;
         let dt_bias = ct.tensor(&format!("{prefix}.ssm_dt.bias"), device)?.dequantize(device)?;
-        let norm_weight = ct.tensor(&format!("{prefix}.ssm_norm.weight"), device)?.dequantize(device)?;
+        let norm_weight_raw = ct.tensor(&format!("{prefix}.ssm_norm.weight"), device)?.dequantize(device)?;
+        // Qwen3.5 uses (1.0 + weight) formulation for RMSNorm
+        let norm_weight = (&norm_weight_raw + 1.0)?;
 
         Ok(Self {
             num_v_heads,
@@ -236,11 +262,12 @@ struct FullAttention {
     attention_wk: Arc<dyn QuantMethod>,
     attention_wv: Arc<dyn QuantMethod>,
     attention_wo: Arc<dyn QuantMethod>,
-    q_norm: QRmsNorm,
-    k_norm: QRmsNorm,
+    q_norm: Qwen35RmsNorm,
+    k_norm: Qwen35RmsNorm,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
+    rot_dim: usize,
     rotary: Arc<RotaryEmbedding>,
     paged_attn: Option<PagedAttention>,
     sdpa_params: SdpaParams,
@@ -289,7 +316,20 @@ impl FullAttention {
         let q = q_flat.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
         let k = k_flat.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
 
-        let (q, k) = self.rotary.forward(&q, &k, start_offsets)?;
+        // Apply partial RoPE (Qwen3.5 uses partial_rotary_factor=0.25)
+        let (q, k) = if self.rot_dim < self.head_dim {
+            let q_rot = q.narrow(3, 0, self.rot_dim)?;
+            let q_pass = q.narrow(3, self.rot_dim, self.head_dim - self.rot_dim)?;
+            let k_rot = k.narrow(3, 0, self.rot_dim)?;
+            let k_pass = k.narrow(3, self.rot_dim, self.head_dim - self.rot_dim)?;
+
+            let (q_rot, k_rot) = self.rotary.forward(&q_rot, &k_rot, start_offsets)?;
+            let q = Tensor::cat(&[q_rot, q_pass], 3)?;
+            let k = Tensor::cat(&[k_rot, k_pass], 3)?;
+            (q, k)
+        } else {
+            self.rotary.forward(&q, &k, start_offsets)?
+        };
 
         let (q, k, v) = (
             q.to_dtype(dtype)?,
@@ -338,14 +378,14 @@ enum TokenMixer {
 struct LayerWeights {
     token_mixer: TokenMixer,
     mlp: Mlp,
-    input_layernorm: QRmsNorm,
-    post_attention_layernorm: QRmsNorm,
+    input_layernorm: Qwen35RmsNorm,
+    post_attention_layernorm: Qwen35RmsNorm,
 }
 
 pub struct ModelWeights {
     tok_embeddings: Embedding,
     layers: Vec<LayerWeights>,
-    norm: QRmsNorm,
+    norm: Qwen35RmsNorm,
     output: Arc<dyn QuantMethod>,
     pub device: Device,
     pub cache: EitherCache,
@@ -495,7 +535,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
 
         let qtok_embeddings = ct.tensor("token_embd.weight", device)?;
         let tok_embeddings = qtok_embeddings.dequantize(device)?;
-        let norm = QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?;
+        let norm = Qwen35RmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?;
         let output = if !ct.has_tensor("output.weight") {
             ct.tensor("token_embd.weight", device)?
         } else {
@@ -511,20 +551,27 @@ impl ModelConfig::FromGGUF for ModelWeights {
             );
         }
 
+        // Qwen3.5 uses partial_rotary_factor=0.25
+        let partial_rotary_factor = 0.25_f64;
+        let rot_dim = (head_dim as f64 * partial_rotary_factor) as usize;
+
         let mut ropes = HashMap::new();
         for layer_idx in 0..block_count {
             let device = mapper.device_for(layer_idx, false).unwrap_or(device);
-            ropes.insert(
-                device.location(),
-                Arc::new(RotaryEmbedding::new(
-                    rope_freq_base,
-                    head_dim,
-                    max_seq_len,
-                    device,
-                    true,
-                    DType::F32,
-                )?),
-            );
+            // Only full attention layers need RoPE
+            if (layer_idx + 1) % full_attention_interval == 0 {
+                ropes.insert(
+                    device.location(),
+                    Arc::new(RotaryEmbedding::new_partial(
+                        rope_freq_base,
+                        rot_dim,
+                        max_seq_len,
+                        device,
+                        true,
+                        DType::F32,
+                    )?),
+                );
+            }
         }
 
         for layer_idx in NiceProgressBar::<_, 'b'>(
@@ -547,11 +594,11 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 let attention_wv = ct.tensor(&format!("{prefix}.attn_v.weight"), device)?;
                 let attention_wo = ct.tensor(&format!("{prefix}.attn_output.weight"), device)?;
 
-                let q_norm = QRmsNorm::new(
+                let q_norm = Qwen35RmsNorm::new(
                     ct.tensor(&format!("{prefix}.attn_q_norm.weight"), device)?,
                     rms_norm_eps,
                 )?;
-                let k_norm = QRmsNorm::new(
+                let k_norm = Qwen35RmsNorm::new(
                     ct.tensor(&format!("{prefix}.attn_k_norm.weight"), device)?,
                     rms_norm_eps,
                 )?;
@@ -585,6 +632,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     n_head: head_count,
                     n_kv_head: head_count_kv,
                     head_dim,
+                    rot_dim,
                     rotary: rotary.clone(),
                     paged_attn,
                     sdpa_params: SdpaParams {
@@ -634,8 +682,8 @@ impl ModelConfig::FromGGUF for ModelWeights {
             layers.push(LayerWeights {
                 token_mixer,
                 mlp,
-                input_layernorm: QRmsNorm::new(attention_norm, rms_norm_eps)?,
-                post_attention_layernorm: QRmsNorm::new(ffn_norm, rms_norm_eps)?,
+                input_layernorm: Qwen35RmsNorm::new(attention_norm, rms_norm_eps)?,
+                post_attention_layernorm: Qwen35RmsNorm::new(ffn_norm, rms_norm_eps)?,
             });
         }
 
