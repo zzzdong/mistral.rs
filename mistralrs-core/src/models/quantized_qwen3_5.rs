@@ -258,31 +258,32 @@ impl FullAttention {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
-        let q = MatMul.qmethod_matmul(x, &*self.attention_wq)?;
+        // Q projection outputs n_head * head_dim * 2 (Q + gate)
+        let q_gate = MatMul.qmethod_matmul(x, &*self.attention_wq)?;
         let k = MatMul.qmethod_matmul(x, &*self.attention_wk)?;
         let v = MatMul.qmethod_matmul(x, &*self.attention_wv)?;
 
-        let (q, k, v) = if seq_len != 1 {
-            let q = q
-                .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
-                .transpose(1, 2)?;
-            let k = k
-                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-                .transpose(1, 2)?;
-            let v = v
-                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-                .transpose(1, 2)?;
-            (q, k, v)
-        } else {
-            let q = q.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
-            let k = k.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
-            let v = v.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
-            (q, k, v)
-        };
+        // Reshape Q to separate Q and gate: (batch, seq, n_head, head_dim * 2)
+        let q_gate = q_gate.reshape((b_sz, seq_len, self.n_head, self.head_dim * 2))?;
+        // Split into Q and gate using chunk (narrow) on last dim
+        let q = q_gate.narrow(3, 0, self.head_dim)?;
+        let gate = q_gate.narrow(3, self.head_dim, self.head_dim)?;
 
-        // Per-head RMSNorm
-        let q_flat = q.flatten(0, 2)?;
-        let k_flat = k.flatten(0, 2)?;
+        // Reshape gate to (batch, seq, n_head * head_dim) for later multiplication
+        let gate = gate.reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
+
+        // Reshape K and V
+        let k = k.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?;
+        let v = v.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?;
+
+        // Transpose Q, K, V for attention: (batch, n_head, seq, head_dim)
+        let q = q.transpose(1, 2)?;
+        let k = k.transpose(1, 2)?;
+        let v = v.transpose(1, 2)?;
+
+        // Per-head RMSNorm - apply to flattened (batch*n_head, seq, head_dim)
+        let q_flat = q.flatten(0, 1)?;
+        let k_flat = k.flatten(0, 1)?;
         let q_flat = self.q_norm.forward(&q_flat)?;
         let k_flat = self.k_norm.forward(&k_flat)?;
         let q = q_flat.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
@@ -317,11 +318,13 @@ impl FullAttention {
             }
         };
 
-        let y = if mask.is_some() {
-            y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?
-        } else {
-            y.reshape((b_sz, seq_len, ()))?
-        };
+        // Reshape output: (batch, n_head, seq, head_dim) -> (batch, seq, n_head * head_dim)
+        let y = y.transpose(1, 2)?.reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
+        
+        // Apply gate with sigmoid - ensure dtype matches
+        let gate_sigmoid = candle_nn::ops::sigmoid(&gate)?;
+        let gate_sigmoid = gate_sigmoid.to_dtype(y.dtype())?;
+        let y = y.broadcast_mul(&gate_sigmoid)?;
 
         MatMul.qmethod_matmul(&y.to_dtype(x.dtype())?, &*self.attention_wo)
     }
@@ -367,6 +370,7 @@ pub(crate) struct PropsGGUF {
     pub linear_key_head_dim: usize,
     pub linear_value_head_dim: usize,
     pub linear_conv_kernel_dim: usize,
+    pub linear_inner_size: usize,
 }
 
 fn verify_qwen35_arch(
@@ -407,6 +411,13 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
             c.get_value::<u32>(key).ok().or_else(|| c.get_value::<u32>(alt_key).ok())
         };
 
+        let linear_key_head_dim = get_meta("ssm.state_size", "qwen3.ssm.state_size")
+            .unwrap_or(128) as usize;
+        let linear_inner_size = get_meta("ssm.inner_size", "qwen3.ssm.inner_size")
+            .unwrap_or(2048) as usize;
+        // num_value_heads = inner_size / head_v_dim
+        let linear_num_value_heads = linear_inner_size / linear_key_head_dim;
+
         let props = Self {
             head_count,
             head_count_kv: c.get_value::<u32>("attention.head_count_kv")? as usize,
@@ -431,15 +442,14 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
             full_attention_interval: get_meta("full_attention_interval", "qwen3.full_attention_interval")
                 .unwrap_or(4) as usize,
             linear_num_key_heads: get_meta("ssm.group_count", "qwen3.ssm.group_count")
-                .unwrap_or(4) as usize,
-            linear_num_value_heads: get_meta("ssm.num_value_heads", "qwen3.ssm.num_value_heads")
-                .unwrap_or(8) as usize,
-            linear_key_head_dim: get_meta("ssm.state_size", "qwen3.ssm.state_size")
-                .unwrap_or(128) as usize,
+                .unwrap_or(16) as usize,
+            linear_num_value_heads,
+            linear_key_head_dim,
             linear_value_head_dim: get_meta("ssm.value_head_dim", "qwen3.ssm.value_head_dim")
                 .unwrap_or(128) as usize,
             linear_conv_kernel_dim: get_meta("ssm.conv_kernel", "qwen3.ssm.conv_kernel")
                 .unwrap_or(4) as usize,
+            linear_inner_size,
         };
 
         Ok(props)
@@ -457,7 +467,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         let meta = ct.get_metadata();
         let actual_arch = verify_qwen35_arch(meta)?;
 
-        ct.print_metadata()?;
+        let _ = ct.print_metadata();
 
         let metadata = ContentMetadata {
             path_prefix: &actual_arch,
@@ -480,6 +490,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             linear_key_head_dim,
             linear_value_head_dim,
             linear_conv_kernel_dim,
+            linear_inner_size: _,
         } = PropsGGUF::try_from(metadata).or_else(|err| candle_core::bail!("{err}"))?;
 
         let qtok_embeddings = ct.tensor("token_embd.weight", device)?;

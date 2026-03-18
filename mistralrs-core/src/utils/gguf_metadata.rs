@@ -563,7 +563,21 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                     + ffn_down
             }
             GGUFArchitecture::Qwen35 => {
-                // Qwen3.5 uses post_attention_norm instead of ffn_norm
+                // Qwen3.5 has hybrid architecture with both Full and Linear attention layers
+                // blk.0 is Linear Attention, blk.3 is Full Attention (assuming full_attention_interval=4)
+                // Get the interval from metadata, default to 4
+                let full_attn_interval = self
+                    .model
+                    .get_metadata()
+                    .get("qwen35.full_attention_interval")
+                    .or_else(|| self.model.get_metadata().get("qwen3.full_attention_interval"))
+                    .and_then(|v| v.to_u32().ok())
+                    .unwrap_or(4) as usize;
+
+                // Find first Full Attention layer (layer_idx where (layer_idx+1) % interval == 0)
+                let first_full_layer = full_attn_interval - 1;
+
+                // Common layers (same for both types)
                 let attn_norm = tensor_info_size_in_bytes!(
                     self.model.tensor_info("blk.0.attn_norm.weight")?,
                     DType::F32
@@ -572,31 +586,70 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                     self.model.tensor_info("blk.0.post_attention_norm.weight")?,
                     DType::F32
                 );
-
-                let attn_q =
-                    tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_q.weight")?);
-                let attn_k =
-                    tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_k.weight")?);
-                let attn_v =
-                    tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_v.weight")?);
-
-                let attn_output = tensor_info_size_in_bytes!(self
-                    .model
-                    .tensor_info("blk.0.attn_output.weight")?);
-
                 let ffn_gate = tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_gate.weight")?);
                 let ffn_up = tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_up.weight")?);
                 let ffn_down = tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_down.weight")?);
 
-                attn_norm
-                    + ffn_norm
-                    + attn_q
-                    + attn_k
-                    + attn_v
-                    + attn_output
-                    + ffn_gate
-                    + ffn_up
-                    + ffn_down
+                // Linear Attention layers (blk.0)
+                let linear_attn = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info("blk.0.attn_qkv.weight")?);
+                let linear_gate = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info("blk.0.attn_gate.weight")?);
+                let linear_beta = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info("blk.0.ssm_beta.weight")?);
+                let linear_alpha = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info("blk.0.ssm_alpha.weight")?);
+                let linear_out = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info("blk.0.ssm_out.weight")?);
+                let linear_conv = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info("blk.0.ssm_conv1d.weight")?);
+                let linear_a = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info("blk.0.ssm_a")?);
+                let linear_dt_bias = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info("blk.0.ssm_dt.bias")?);
+                let linear_norm = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info("blk.0.ssm_norm.weight")?);
+
+                let linear_total = linear_attn
+                    + linear_gate
+                    + linear_beta
+                    + linear_alpha
+                    + linear_out
+                    + linear_conv
+                    + linear_a
+                    + linear_dt_bias
+                    + linear_norm;
+
+                // Full Attention layers (blk.{first_full_layer})
+                let full_prefix = format!("blk.{first_full_layer}");
+                let full_q =
+                    tensor_info_size_in_bytes!(self.model.tensor_info(&format!("{full_prefix}.attn_q.weight"))?);
+                let full_k =
+                    tensor_info_size_in_bytes!(self.model.tensor_info(&format!("{full_prefix}.attn_k.weight"))?);
+                let full_v =
+                    tensor_info_size_in_bytes!(self.model.tensor_info(&format!("{full_prefix}.attn_v.weight"))?);
+                let full_output = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{full_prefix}.attn_output.weight"))?);
+                let full_q_norm = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{full_prefix}.attn_q_norm.weight"))?);
+                let full_k_norm = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{full_prefix}.attn_k_norm.weight"))?);
+
+                let full_total = full_q + full_k + full_v + full_output + full_q_norm + full_k_norm;
+
+                attn_norm + ffn_norm + ffn_gate + ffn_up + ffn_down + linear_total + full_total
             }
             GGUFArchitecture::Starcoder2 => {
                 let attn_norm = tensor_info_size_in_bytes!(
