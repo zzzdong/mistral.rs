@@ -350,6 +350,43 @@ impl QRmsNorm {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct QGemmaRmsNorm {
+    eps: f64,
+    original_weight: Tensor,  // 存储原始权重（用于可能的序列化）
+    weight: Tensor,            // 存储 weight + 1.0 的结果（用于 forward）
+}
+
+impl QGemmaRmsNorm {
+    /// 从 QTensor 创建 Gemma 风格的 RMSNorm (weight + 1.0)
+    pub fn new(scale: QTensor, eps: f32) -> Result<Self> {
+        let original_weight = scale.dequantize(&scale.device())?;
+        let weight = (&original_weight + 1.0)?;
+        
+        Ok(Self {
+            eps: eps as f64,
+            original_weight,
+            weight,
+        })
+    }
+    
+    /// 如果需要保存原始权重（例如用于 UQFF 序列化）
+    pub fn original_weight(&self) -> &Tensor {
+        &self.original_weight
+    }
+    
+    /// 获取用于 forward 的权重（已经加了 1.0）
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
+    }
+}
+
+impl Module for QGemmaRmsNorm {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        candle_nn::ops::rms_norm(&x.contiguous()?, &self.weight, self.eps as f32)
+    }
+}
+
 /// RoPE supporting LongRope
 #[derive(Debug, Clone)]
 pub struct PhiRotaryEmbedding {
