@@ -42,6 +42,7 @@ use crate::{
     models::quantized_phi3::ModelWeights as QPhi3,
     models::quantized_qwen::ModelWeights as QQwen,
     models::quantized_qwen3::ModelWeights as QQwen3,
+    models::quantized_qwen3_5::ModelWeights as QQwen3_5,
     models::quantized_qwen3_moe::ModelWeights as QQwen3MoE,
     models::quantized_starcoder2::ModelWeights as QStarcoder2,
     utils::tokens::get_token,
@@ -71,6 +72,7 @@ enum Model {
     Starcoder2(QStarcoder2),
     Qwen(QQwen),
     Qwen3(QQwen3),
+    Qwen3_5(QQwen3_5),
     Qwen3MoE(QQwen3MoE),
 }
 
@@ -481,6 +483,7 @@ impl Loader for GGUFLoader {
                 }
                 GGUFArchitecture::Qwen2 => Model::Qwen(QQwen::try_from(model_config)?),
                 GGUFArchitecture::Qwen3 => Model::Qwen3(QQwen3::try_from(model_config)?),
+                GGUFArchitecture::Qwen35 => Model::Qwen3_5(QQwen3_5::try_from(model_config)?),
                 GGUFArchitecture::Qwen3MoE => Model::Qwen3MoE(QQwen3MoE::try_from(model_config)?),
                 a => bail!("Unsupported architecture `{a:?}` for GGUF"),
             },
@@ -547,6 +550,7 @@ impl Loader for GGUFLoader {
             Model::Starcoder2(ref p) => p.max_seq_len,
             Model::Qwen(ref p) => p.max_seq_len,
             Model::Qwen3(ref p) => p.max_seq_len,
+            Model::Qwen3_5(ref p) => p.max_seq_len,
             Model::Qwen3MoE(ref p) => p.max_seq_len,
         };
         let llg_factory = build_llg_factory(tokenizer.clone())?;
@@ -559,6 +563,7 @@ impl Loader for GGUFLoader {
             Model::Starcoder2(ref model) => model.cache.normal().0.len(),
             Model::Qwen(ref model) => model.cache.normal().0.len(),
             Model::Qwen3(ref model) => model.cache.normal().0.len(),
+            Model::Qwen3_5(ref model) => model.cache.normal().0.len(),
             Model::Qwen3MoE(ref model) => model.cache.normal().0.len(),
         };
 
@@ -692,6 +697,7 @@ impl CacheManagerMixin for GGUFPipeline {
             Model::Starcoder2(ref model) => &model.cache,
             Model::Qwen(ref model) => &model.cache,
             Model::Qwen3(ref model) => &model.cache,
+            Model::Qwen3_5(ref model) => &model.cache,
             Model::Qwen3MoE(ref model) => &model.cache,
         }
     }
@@ -708,6 +714,7 @@ impl MetadataMixin for GGUFPipeline {
             Model::Starcoder2(ref model) => model.device.clone(),
             Model::Qwen(ref model) => model.device.clone(),
             Model::Qwen3(ref model) => model.device.clone(),
+            Model::Qwen3_5(ref model) => model.device.clone(),
             Model::Qwen3MoE(ref model) => model.device.clone(),
         }
     }
@@ -801,6 +808,9 @@ impl Pipeline for GGUFPipeline {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
             }
             Model::Qwen3(ref model) => {
+                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+            }
+            Model::Qwen3_5(ref mut model) => {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
             }
             Model::Qwen3MoE(ref model) => {

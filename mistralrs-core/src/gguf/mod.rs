@@ -28,6 +28,7 @@ pub enum GGUFArchitecture {
     Starcoder2,
     Qwen2,
     Qwen3,
+    Qwen35,
     Qwen3MoE,
     Mistral3,
 }
